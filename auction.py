@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import heapq
 import re
+import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Deque, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -21,106 +22,238 @@ class OrderListChangedException(Exception):
     pass
 
 
+@dataclass(order=True)
+class _QueueEntry:
+    """Внутренний элемент очереди с метаданными."""
+
+    priority: int
+    sequence: int
+    order_id: str = field(compare=False)
+    creation_ts: int = field(compare=False)
+    payload: Dict = field(compare=False)
+    first_seen: float = field(compare=False)
+    last_seen: float = field(compare=False)
+    stale: bool = field(default=False, compare=False)
+
+
 class SmartOrderQueue:
     """Умная очередь заказов с приоритетами по времени создания."""
 
-    def __init__(self):
-        # Приоритетная очередь: (timestamp, counter, order_data)
-        # Используем heapq для сортировки по времени (свежие вперед)
-        # counter нужен для разрешения коллизий при одинаковых timestamp
-        self.queue = []  # type: List[Tuple[int, int, Dict]]
-        self.processed_ids = set()  # Уже обработанные заказы
-        self.known_ids = set()  # Все известные заказы (для определения новых)
-        self.last_update = 0
-        self.counter = 0  # Счётчик для уникальности
+    _COMPACT_FACTOR = 3
 
+    def __init__(self) -> None:
+        # Приоритетная куча с ленивым удалением устаревших элементов
+        self._heap: List[_QueueEntry] = []
+        self._active: Dict[str, _QueueEntry] = {}
+        self.processed_ids: Set[str] = set()
+        self.known_ids: Set[str] = set()
+        self.last_update: float = 0.0
+        self._sequence: int = 0
+
+    # region Public API
     def add_orders(self, orders: List[Dict]) -> int:
-        """Добавить новые заказы в очередь. Возвращает количество добавленных."""
+        """Добавить новые или обновленные заказы в очередь."""
+
+        if not orders:
+            return 0
+
         new_count = 0
+        now = time.time()
+
         for order in orders:
-            order_id = order.get('id')
+            if not isinstance(order, dict):
+                logging.debug("Пропускаем некорректный объект заказа: %r", order)
+                continue
+
+            order_id = self._extract_order_id(order)
             if not order_id:
                 logging.debug("Пропускаем заказ без ID")
                 continue
+
             if order_id in self.processed_ids:
-                logging.debug(f"Заказ {order_id} уже обработан, пропускаем")
+                logging.debug("Заказ %s уже обработан, пропускаем", order_id)
                 continue
 
-            if order_id not in self.known_ids:
-                # Новый заказ - добавить в очередь
-                timestamp = order.get('creation', 0)
-                self.counter += 1
-                heapq.heappush(self.queue, (-timestamp, self.counter, order))  # Отрицательный для убывания
-                self.known_ids.add(order_id)
-                new_count += 1
-                logging.debug(f"✅ Добавлен новый заказ {order_id} в очередь (timestamp: {timestamp})")
-            else:
-                logging.debug(f"Заказ {order_id} уже известен, пропускаем")
+            creation_ts = self._extract_creation_ts(order, now)
 
-        logging.info(f"📊 Добавлено {new_count} новых заказов в очередь")
+            if order_id in self._active:
+                # Обновляем существующий заказ
+                logging.debug("Обновляем данные заказа %s", order_id)
+                self._replace_entry(order_id, creation_ts, order, now)
+            else:
+                logging.debug("Добавляем новый заказ %s", order_id)
+                self._add_new_entry(order_id, creation_ts, order, now)
+                new_count += 1
+                self.known_ids.add(order_id)
+
+        if new_count:
+            logging.info("📊 Добавлено %s новых заказов в очередь", new_count)
+
+        self.last_update = now
+        self._compact_heap_if_needed()
         return new_count
 
     def get_next_order(self) -> Optional[Dict]:
         """Получить следующий заказ из очереди (самый свежий)."""
-        if self.queue:
-            timestamp, counter, order = heapq.heappop(self.queue)
-            order_id = order.get('id')
-            if order_id:
-                self.processed_ids.add(order_id)
-                logging.info(f"🎯 Извлекаем заказ {order_id} из очереди")
-            return order
-        else:
+
+        entry = self._pop_active_entry()
+        if not entry:
             logging.debug("📋 Очередь пуста")
-        return None
+            return None
+
+        self.processed_ids.add(entry.order_id)
+        logging.info("🎯 Извлекаем заказ %s из очереди", entry.order_id)
+        return dict(entry.payload)
 
     def peek_next_order(self) -> Optional[Dict]:
         """Посмотреть следующий заказ без извлечения из очереди."""
-        if self.queue:
-            timestamp, counter, order = self.queue[0]
-            return order
+
+        entry = self._peek_active_entry()
+        if entry:
+            return dict(entry.payload)
         return None
 
     def mark_processed(self, order_id: str) -> None:
-        """Пометить заказ как обработанный."""
+        """Пометить заказ как обработанный (и удалить из очереди)."""
+
+        if not order_id:
+            return
+
         self.processed_ids.add(order_id)
+        entry = self._active.pop(order_id, None)
+        if entry:
+            entry.stale = True
 
     def get_queue_size(self) -> int:
-        """Получить размер очереди."""
-        return len(self.queue)
+        """Получить количество актуальных заказов в очереди."""
+
+        return len(self._active)
 
     def get_stats(self) -> Dict:
         """Получить статистику очереди."""
+
         return {
-            'queue_size': len(self.queue),
-            'processed_count': len(self.processed_ids),
-            'known_count': len(self.known_ids),
-            'last_update': self.last_update
+            "queue_size": len(self._active),
+            "processed_count": len(self.processed_ids),
+            "known_count": len(self.known_ids),
+            "last_update": self.last_update,
         }
 
     def clear_old_orders(self, max_age_hours: int = 24) -> int:
-        """Очистить старые заказы из очереди. Возвращает количество удаленных."""
-        if not self.queue:
+        """Очистить заказы, которые устарели по дате создания."""
+
+        if not self._active:
             return 0
 
-        cutoff_time = datetime.now().timestamp() - (max_age_hours * 3600)
-        old_queue = []
+        cutoff = time.time() - max_age_hours * 3600
+        removed = 0
 
-        # Перенести свежие заказы во временную очередь
-        removed_count = 0
-        while self.queue:
-            neg_timestamp, order = heapq.heappop(self.queue)
-            timestamp = -neg_timestamp
+        for order_id, entry in list(self._active.items()):
+            if entry.creation_ts < cutoff:
+                logging.debug("Удаляем устаревший заказ %s", order_id)
+                entry.stale = True
+                self._active.pop(order_id, None)
+                removed += 1
 
-            if timestamp >= cutoff_time:
-                old_queue.append((neg_timestamp, order))
-            else:
-                removed_count += 1
+        if removed:
+            self._rebuild_heap()
 
-        # Восстановить очередь
-        self.queue = old_queue
-        heapq.heapify(self.queue)
+        return removed
 
-        return removed_count
+    # endregion
+
+    # region Internal helpers
+    def _extract_order_id(self, order: Dict) -> Optional[str]:
+        order_id = order.get("id") or order.get("order_id")
+        if isinstance(order_id, (int, float)):
+            return str(int(order_id))
+        if isinstance(order_id, str):
+            order_id = order_id.strip()
+            return order_id or None
+        return None
+
+    def _extract_creation_ts(self, order: Dict, fallback: float) -> int:
+        raw_value = order.get("creation") or order.get("created_at")
+
+        if isinstance(raw_value, (int, float)):
+            timestamp = int(raw_value)
+            if timestamp > 0:
+                return timestamp
+
+        if isinstance(raw_value, str):
+            try:
+                timestamp = int(float(raw_value))
+                if timestamp > 0:
+                    return timestamp
+            except ValueError:
+                pass
+
+        return int(fallback)
+
+    def _replace_entry(self, order_id: str, creation_ts: int, order: Dict, now: float) -> None:
+        existing = self._active.get(order_id)
+        if existing:
+            existing.stale = True
+            merged_payload = dict(existing.payload)
+            merged_payload.update(order)
+            first_seen = existing.first_seen
+        else:
+            merged_payload = dict(order)
+            first_seen = now
+
+        self._active[order_id] = self._create_entry(order_id, creation_ts, merged_payload, first_seen, now)
+
+    def _add_new_entry(self, order_id: str, creation_ts: int, order: Dict, now: float) -> None:
+        payload = dict(order)
+        self._active[order_id] = self._create_entry(order_id, creation_ts, payload, now, now)
+
+    def _create_entry(self, order_id: str, creation_ts: int, payload: Dict, first_seen: float, now: float) -> _QueueEntry:
+        self._sequence += 1
+        entry = _QueueEntry(
+            priority=-creation_ts,
+            sequence=self._sequence,
+            order_id=order_id,
+            creation_ts=creation_ts,
+            payload=payload,
+            first_seen=first_seen,
+            last_seen=now,
+        )
+        heapq.heappush(self._heap, entry)
+        return entry
+
+    def _compact_heap_if_needed(self) -> None:
+        # Удаляем "мертвые" элементы, если их стало слишком много
+        if len(self._heap) <= self._COMPACT_FACTOR * max(1, len(self._active)):
+            return
+
+        self._rebuild_heap()
+
+    def _rebuild_heap(self) -> None:
+        self._heap = [entry for entry in self._active.values() if not entry.stale]
+        heapq.heapify(self._heap)
+
+    def _pop_active_entry(self) -> Optional[_QueueEntry]:
+        while self._heap:
+            entry = heapq.heappop(self._heap)
+            current = self._active.get(entry.order_id)
+            if entry.stale or current is not entry:
+                continue
+            self._active.pop(entry.order_id, None)
+            entry.last_seen = time.time()
+            return entry
+        return None
+
+    def _peek_active_entry(self) -> Optional[_QueueEntry]:
+        while self._heap:
+            entry = self._heap[0]
+            current = self._active.get(entry.order_id)
+            if entry.stale or current is not entry:
+                heapq.heappop(self._heap)
+                continue
+            return entry
+        return None
+
+    # endregion
 
 
 class OrderTimeParser:
