@@ -1,0 +1,661 @@
+"""Auction scanning and bidding helpers."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, Dict, Optional, Set, Tuple
+
+from playwright.async_api import Locator, Page, TimeoutError
+
+from . import config, human, logging
+
+
+ORDER_LIST = "div.styled__OrderListStyled-sc-anwyvn-0"
+ORDER_CARD = f"{ORDER_LIST} div.styled__Container-sc-bhkcjd-0"
+CARD_TITLE_ANCHOR = "a[href*='/order/']"
+ORDER_HIDE_BUTTON = "button.auctionOrder_hideBtn"
+MY_BID_BADGE = "div.orderOfferBid, div:has-text('Моя ставка'), div:has-text('Заказчик не заинтересован вашей ставкой')"
+MAKE_OFFER_BUTTON = "div.styled__ActionsStyled-sc-do1gbv-0 button:has(.uikit-button_label:has-text('Поставить ставку'))"
+MODAL = "div.styled__AuctionOrderModalStyled-sc-172cjna-0"
+PRICE_INPUT = "#MakeOffer__inputBid"
+COMMENT_INPUT = "#makeOffer_comment"
+SUBMIT_BUTTON = "button:has(.uikit-button_label:has-text('Поставить ставку'))"
+CAPTCHA_FRAME = "iframe[src*='smartcaptcha']"
+DISMISSED_PANEL = "div.styled__DismissedInfoStyled-sc-133qlln-0"
+
+
+@dataclass
+class OrderStub:
+    title: str | None = None
+    work_type: str | None = None
+    subject: str | None = None
+
+
+async def ensure_orders_loaded(page: Page, timeout_ms: int = 10000) -> bool:
+    loader = page.locator("div[role='progressbar']")
+    try:
+        await loader.wait_for(state="hidden", timeout=timeout_ms)
+    except TimeoutError:
+        logging.warning("Список заказов не успел скрыть спиннер — продолжаем с тем, что есть.")
+
+    cards = page.locator(ORDER_CARD)
+    try:
+        await cards.first.wait_for(state="attached", timeout=timeout_ms)
+        return True
+    except TimeoutError:
+        if await cards.count() == 0:
+            logging.warning("На странице нет карточек заказов (возможно, фильтр пустой).")
+        else:
+            logging.warning("Карточки нашлись в DOM, но остаются невидимыми.")
+        return False
+
+
+async def highlight(card: Locator, duration: float = 0.4) -> None:
+    try:
+        await card.evaluate(
+            "(node) => { node.dataset.prevShadow = node.style.boxShadow; node.style.boxShadow = '0 0 0 2px rgba(87, 121, 255, 0.8)'; }"
+        )
+        await asyncio.sleep(duration)
+        await card.evaluate(
+            "(node) => { node.style.boxShadow = node.dataset.prevShadow || ''; delete node.dataset.prevShadow; }"
+        )
+    except Exception:
+        pass
+
+
+async def scroll_and_scan(page: Page, cfg: config.BidConfig, tracker: "OrderTracker", trigger: "HybridTrigger") -> Optional[Locator]:
+    await force_close_modal(page, page.locator(MODAL), aggressive=True, reason="Перед сканированием закрываем подвисшую модалку.")
+    cards = page.locator(ORDER_CARD)
+    loaded = await ensure_orders_loaded(page)
+    if not loaded:
+        logging.warning("Не дождались загрузки заказов.")
+        return None
+
+    tracker.begin_cycle()
+
+    for order_hint in trigger.iter_priority_hints():
+        button = await find_first_available_button(cards, tracker, prefer_top=True, order_hint=order_hint)
+        if button:
+            return button
+
+    fresh_button = await find_first_available_button(cards, tracker, prefer_top=True)
+    if fresh_button:
+        return fresh_button
+
+    scroll_container = page.locator(ORDER_LIST)
+
+    for attempt in range(cfg.max_scrolls):
+        tracker.begin_cycle()
+        button = await find_first_available_button(cards, tracker)
+        if button:
+            return button
+        logging.info(f"Кнопок нет, скроллим попытка {attempt + 1}...")
+        distance = await human.human_scroll(
+            page,
+            container=scroll_container,
+            total_range=cfg.scroll_step_range,
+            step_range=(200, 240),
+        )
+        logging.info(f"Скроллим вниз на ~{int(distance)}px")
+        await human.pause((250, 420))
+
+    logging.warning("Пролистали ленту, но кнопок ставок не нашли.")
+    recovery = await human.human_scroll(
+        page,
+        container=scroll_container,
+        total_range=cfg.scroll_recovery_range,
+        step_range=(180, 220),
+    )
+    logging.info(f"Возвратный скролл на ~{int(recovery)}px")
+    return None
+
+
+async def find_first_available_button(cards: Locator, tracker: "OrderTracker", prefer_top: bool = False, order_hint: Optional[str] = None) -> Optional[Locator]:
+    count = await cards.count()
+    if prefer_top:
+        count = min(count, tracker.prefer_top_window)
+
+    for idx in range(count):
+        card = cards.nth(idx)
+        order_id = await tracker.extract_order_id(card)
+        if order_hint and order_id != order_hint:
+            continue
+        if order_id and not tracker.can_attempt(order_id):
+            continue
+
+        if await card.locator(MY_BID_BADGE).count():
+            tracker.mark_exhausted(order_id)
+            continue
+
+        offer_buttons = card.locator(MAKE_OFFER_BUTTON)
+        if await offer_buttons.count():
+            btn = offer_buttons.first
+            if await btn.is_enabled():
+                try:
+                    await card.hover()
+                except Exception:
+                    pass
+                await highlight(card)
+                tracker.mark_seen(order_id)
+                return btn
+    return None
+
+
+async def extract_order_info(modal: Locator) -> OrderStub:
+    title_locator = modal.locator("div.auctionOrderTitle")
+    if not await title_locator.count():
+        title_locator = modal.locator("h1, h2, h3").first
+    try:
+        raw_title = await title_locator.first.text_content(timeout=5_000)
+    except TimeoutError:
+        raw_title = ""
+
+    def field_value(label: str) -> Locator:
+        return modal.locator(
+            f"div.styled__FieldStyled-sc-12kp2q-1:has(div:text('{label}')) div[data-has-value='true']"
+        )
+
+    work_type_loc = field_value("Тип работы")
+    subject_loc = field_value("Предмет")
+
+    work_type = (await work_type_loc.first.text_content()) if await work_type_loc.count() else None
+    subject = (await subject_loc.first.text_content()) if await subject_loc.count() else None
+
+    return OrderStub(title=raw_title.strip(), work_type=work_type, subject=subject)
+
+
+async def place_bid(page: Page, cfg: config.BidConfig) -> bool:
+    from . import filters as filter_module
+
+    # Check and reapply filters if needed before each bid attempt
+    if cfg.filter_config.auto_apply_filters:
+        filter_manager = filter_module.FilterManager(page, cfg.filter_config)
+        filters_ok = await filter_manager.apply_filters_if_needed()
+        if not filters_ok:
+            logging.warning("Фильтры не применены, продолжаем без них")
+
+    tracker = OrderTracker(cfg=cfg)
+    trigger = getattr(page, "_bot_hybrid_trigger", None)
+    if trigger:
+        trigger.update_tracker(tracker)
+    else:
+        trigger = HybridTrigger(page, tracker)
+        await trigger.start()
+        setattr(page, "_bot_hybrid_trigger", trigger)
+
+    button = await scroll_and_scan(page, cfg, tracker, trigger)
+    if not button:
+        logging.warning("Не нашли подходящую карточку для ставки.")
+        return False
+
+    workflow = BidWorkflow(page=page, trigger_button=button, cfg=cfg, tracker=tracker, trigger=trigger)
+    return await workflow.run()
+
+
+class BidWorkflow:
+    def __init__(self, page: Page, trigger_button: Locator, cfg: config.BidConfig, tracker: "OrderTracker", trigger: "HybridTrigger") -> None:
+        self.page = page
+        self.trigger_button = trigger_button
+        self.cfg = cfg
+        self.modal = page.locator(MODAL)
+        self.submission_done = False
+        self.tracker = tracker
+        self.trigger = trigger
+        self.current_order_id: str | None = tracker.current_order
+
+    async def run(self) -> bool:
+        try:
+            await close_overlays(self.page)
+            if not await self._open_modal():
+                return False
+
+            order = await extract_order_info(self.modal)
+            message = self.cfg.build_message(order.title, order.work_type, order.subject)
+
+            if not await self._prepare_fields(message):
+                return False
+
+            if not await self._click_submit():
+                return False
+
+            logging.success(f"Ставка отправлена по заказу: {order.title}")
+            await self.trigger.notify_success(order_id=self.current_order_id)
+            await self._post_success_scroll()
+            return True
+        finally:
+            if not self.submission_done:
+                await self._fallback_close()
+            await force_close_modal(self.page, self.modal, aggressive=True, reason="Страховка после завершения воркфлоу.")
+            self.tracker.mark_attempt_completed(success=self.submission_done, order_id=self.current_order_id)
+
+    async def _run_step(self, name: str, coro) -> bool:
+        logging.step(name, "start")
+        try:
+            result = await coro()
+        except Exception as exc:  # noqa: BLE001
+            logging.step(name, "fail", detail=str(exc))
+            raise
+        if result:
+            logging.step(name, "success")
+        else:
+            logging.step(name, "fail")
+        return result
+
+    async def _open_modal(self) -> bool:
+        async def action() -> bool:
+            try:
+                await human.ensure_visible(self.trigger_button)
+                await human.human_click(self.trigger_button)
+            except TimeoutError:
+                logging.warning("Стандартный клик не сработал, пробуем dispatchEvent")
+                await close_overlays(self.page)
+                await self.trigger_button.dispatch_event("click")
+
+            try:
+                await self.modal.wait_for(state="visible", timeout=8_000)
+                return True
+            except TimeoutError:
+                if not await self.modal.count():
+                    logging.error("Модалка ставки не появилась.")
+                    return False
+                logging.warning("Модалка отрисовалась частично, продолжаем осторожно.")
+                return True
+
+        return await self._run_step("open_modal", action)
+
+    async def _prepare_fields(self, message: str) -> bool:
+        price_input = self.modal.locator(PRICE_INPUT)
+        comment_input = self.modal.locator(COMMENT_INPUT)
+
+        async def fill_bid_amount() -> bool:
+            try:
+                await human.ensure_visible(price_input)
+            except TimeoutError:
+                raise
+            await human.fill_field(
+                price_input,
+                str(self.cfg.bid_amount),
+                enable_typos=False,
+                fast=self.cfg.fast_comment_fill,
+            )
+            value = await price_input.input_value()
+            normalized = value.replace("\xa0", "").replace(" ", "")
+            return normalized == str(self.cfg.bid_amount)
+
+        async def fill_comment() -> bool:
+            await human.ensure_visible(comment_input)
+            await human.fill_field(
+                comment_input,
+                message,
+                enable_typos=not self.cfg.fast_comment_fill,
+                fast=self.cfg.fast_comment_fill,
+            )
+            current = await comment_input.input_value()
+            return current.strip() == message.strip()
+
+        if not await self._run_step("fill_bid", fill_bid_amount):
+            return False
+        if not await self._run_step("fill_comment", fill_comment):
+            return False
+        return True
+
+    async def _click_submit(self) -> bool:
+        submit = self.modal.locator(SUBMIT_BUTTON)
+
+        async def action() -> bool:
+            await human.ensure_visible(submit)
+            await submit.wait_for(state="visible", timeout=5_000)
+            for _ in range(12):
+                if not await submit.is_disabled():
+                    break
+                logging.info("Кнопка ставки неактивна, ждём перерасчёт…")
+                await asyncio.sleep(0.5)
+            else:
+                logging.error("Кнопка ставки не активировалась.")
+                return False
+
+            await close_overlays(self.page, exclude=self.modal)
+
+            await self.tracker.ensure_min_interval(self.cfg.min_bid_interval_seconds)
+
+            await human.human_click(submit)
+            try:
+                await self.modal.wait_for(state="hidden", timeout=10_000)
+                self.submission_done = True
+                return True
+            except TimeoutError:
+                if await self.page.locator(CAPTCHA_FRAME).count():
+                    logging.warning("Запрос капчи — требуется ручное вмешательство.")
+                else:
+                    logging.error("После отправки модалка осталась открыта.")
+                return False
+
+        return await self._run_step("click_submit", action)
+
+    async def _fallback_close(self) -> None:
+        if not await self.modal.count():
+            return
+
+        try:
+            visible = await self.modal.is_visible()
+        except Exception:
+            visible = False
+
+        if not visible:
+            return
+
+        selectors = (
+            "button:has-text('Закрыть')",
+            "button:has-text('Отмена')",
+            "button:has(.uikit-button_label:has-text('Закрыть'))",
+            "button.dialog-window-close-button",
+        )
+
+        for selector in selectors:
+            try:
+                close_btn = self.modal.locator(selector).first
+                if await close_btn.count():
+                    await close_btn.click(timeout=800)
+                    await self.modal.wait_for(state="hidden", timeout=2_000)
+                    return
+            except Exception:
+                continue
+
+        try:
+            await self.page.keyboard.press("Escape")
+            await self.modal.wait_for(state="hidden", timeout=2_000)
+        except Exception:
+            pass
+
+    async def _post_success_scroll(self) -> None:
+        await human.pause((160, 280))
+        await human.human_scroll(
+            self.page,
+            container=self.page.locator(ORDER_LIST),
+            total_range=self.cfg.post_bid_scroll_range,
+            step_range=(200, 240),
+        )
+
+class OrderTracker:
+    ID_PATTERN = re.compile(r"/order/(?:getoneorder/)?(\d+)")
+
+    def __init__(self, cfg: config.BidConfig) -> None:
+        self.cfg = cfg
+        self.attempts: Dict[str, int] = {}
+        self.exhausted: Set[str] = set()
+        self.seen_this_round: Set[str] = set()
+        self.current_order: Optional[str] = None
+        self.last_bid_ts: float = 0.0
+        self.prefer_top_window: int = 6
+
+    def begin_cycle(self) -> None:
+        self.seen_this_round.clear()
+        self.current_order = None
+
+    async def extract_order_id(self, card: Locator) -> Optional[str]:
+        try:
+            href = await card.locator(CARD_TITLE_ANCHOR).get_attribute("href")
+        except Exception:
+            href = None
+        if href:
+            match = self.ID_PATTERN.search(href)
+            if match:
+                return match.group(1)
+        try:
+            data_id = await card.get_attribute("data-id")
+        except Exception:
+            data_id = None
+        if data_id and data_id.isdigit():
+            return data_id
+        return None
+
+    def can_attempt(self, order_id: Optional[str]) -> bool:
+        if not order_id:
+            return True
+        if order_id in self.exhausted:
+            return False
+        if order_id in self.seen_this_round:
+            return False
+        return self.attempts.get(order_id, 0) < self.cfg.max_order_retries
+
+    def mark_seen(self, order_id: Optional[str]) -> None:
+        if order_id:
+            self.seen_this_round.add(order_id)
+            self.current_order = order_id
+
+    def mark_exhausted(self, order_id: Optional[str]) -> None:
+        if order_id:
+            self.exhausted.add(order_id)
+
+    def mark_attempt_completed(self, *, success: bool, order_id: Optional[str]) -> None:
+        if not order_id:
+            return
+        attempts = self.attempts.get(order_id, 0) + 1
+        self.attempts[order_id] = attempts
+        if success or attempts >= self.cfg.max_order_retries:
+            self.exhausted.add(order_id)
+        self.current_order = None
+        loop = asyncio.get_running_loop()
+        self.last_bid_ts = loop.time()
+
+    async def ensure_min_interval(self, min_interval: float) -> None:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        delta = now - self.last_bid_ts
+        if delta < min_interval:
+            wait_for = min_interval - delta
+            logging.info(f"Ждём {wait_for:.2f}с до следующей ставки (лимит интервала)")
+            await asyncio.sleep(wait_for)
+
+
+async def close_overlays(page: Page, *, exclude: Locator | None = None) -> None:
+    dismissed = page.locator(DISMISSED_PANEL)
+    if await dismissed.count():
+        logging.info("Закрываем панель скрытых заказов.")
+        try:
+            await dismissed.locator("button").click(timeout=1_000)
+        except Exception:
+            pass
+
+    exclude_handle = await exclude.element_handle() if exclude else None
+
+    for selector, description in (
+        ("div[data-testid='tooltip-close']", "подсказка"),
+        ("button:has-text('Понятно')", "диалог подтверждения"),
+        ("[data-testid='close-button']", "всплывающее окно"),
+    ):
+        overlay = page.locator(selector)
+        if not await overlay.count():
+            continue
+
+        handle = await overlay.first.element_handle()
+        if handle and exclude_handle:
+            try:
+                inside_modal = await page.evaluate(
+                    "(el, root) => !!root && root.contains(el)",
+                    handle,
+                    exclude_handle,
+                )
+            except Exception:
+                inside_modal = False
+            if inside_modal:
+                continue
+
+        logging.info(f"Закрываем {description} ({selector})")
+        try:
+            await overlay.first.click(timeout=1_000)
+        except Exception:
+            pass
+
+
+async def force_close_modal(page: Page, modal: Locator, *, aggressive: bool = False, reason: str | None = None) -> None:
+    try:
+        if not await modal.count():
+            return
+    except Exception:
+        return
+
+    try:
+        visible = await modal.is_visible()
+    except Exception:
+        visible = False
+
+    if not visible:
+        return
+
+    if reason:
+        logging.info(reason)
+
+    if aggressive:
+        try:
+            await page.mouse.click(5, 5)
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.2)
+
+        try:
+            await modal.wait_for(state="hidden", timeout=1_000)
+            return
+        except Exception:
+            pass
+
+    try:
+        close_btn = modal.locator("button:has-text('Закрыть')").first
+        if await close_btn.count():
+            await close_btn.click(timeout=1_000)
+            await modal.wait_for(state="hidden", timeout=2_000)
+            return
+    except Exception:
+        pass
+
+    if aggressive:
+        try:
+            await page.evaluate(
+                "(selector) => { const node = document.querySelector(selector); if (node && node.parentElement) { node.parentElement.removeChild(node); } }",
+                MODAL,
+            )
+        except Exception:
+            pass
+
+class HybridTrigger:
+    def __init__(self, page: Page, tracker: "OrderTracker") -> None:
+        self.page = page
+        self.tracker = tracker
+        self.priority_queue: Deque[str] = deque()
+        self._running = False
+        self._binding_installed = False
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        await self._install_dom_observer()
+        self._attach_websocket_listener()
+
+    def update_tracker(self, tracker: "OrderTracker") -> None:
+        self.tracker = tracker
+
+    async def stop_if_needed(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        self.priority_queue.clear()
+        self._binding_installed = False
+
+    async def notify_success(self, order_id: Optional[str]) -> None:
+        if not order_id:
+            return
+        self.discard_hint(order_id)
+
+    def iter_priority_hints(self) -> list[str]:
+        hints: list[str] = []
+        for _ in range(len(self.priority_queue)):
+            order_id = self.priority_queue.popleft()
+            if not self.tracker.can_attempt(order_id):
+                continue
+            hints.append(order_id)
+            self.priority_queue.append(order_id)
+        return hints
+
+    def discard_hint(self, order_id: Optional[str]) -> None:
+        if not order_id:
+            return
+        try:
+            self.priority_queue.remove(order_id)
+        except ValueError:
+            pass
+
+    async def _install_dom_observer(self) -> None:
+        if not self._binding_installed:
+            await self.page.expose_binding("__botOrderHint", lambda source, href: asyncio.create_task(self._handle_dom_hint(href)))
+            self._binding_installed = True
+
+        script = """
+            (() => {
+                const install = () => {
+                    const emit = (href) => {
+                        if (window.__botOrderHint) {
+                            window.__botOrderHint(href);
+                        }
+                    };
+                    const target = document.querySelector("div.styled__OrderListStyled-sc-anwyvn-0");
+                    if (!target) return;
+                    if (target.__botObserverInstalled) return;
+                    target.__botObserverInstalled = true;
+                    const observer = new MutationObserver((mutations) => {
+                        for (const mutation of mutations) {
+                            for (const node of mutation.addedNodes) {
+                                if (!(node instanceof HTMLElement)) continue;
+                                const anchor = node.querySelector("a[href*='/order/']");
+                                if (anchor) emit(anchor.href);
+                            }
+                        }
+                    });
+                    observer.observe(target, { childList: true, subtree: true });
+                };
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', install, { once: true });
+                } else {
+                    install();
+                }
+            })();
+        """
+        await self.page.add_init_script(script)
+        await self.page.evaluate(script)
+
+    def _attach_websocket_listener(self) -> None:
+        def on_ws(ws):
+            ws.on("framereceived", lambda frame: asyncio.create_task(self._handle_ws_frame(frame)))
+        self.page.on("websocket", on_ws)
+
+    async def _handle_ws_frame(self, frame) -> None:
+        payload = getattr(frame, "payload", None)
+        if payload is None and isinstance(frame, dict):
+            payload = frame.get("payload")
+        if not payload:
+            return
+        order_id = self._extract_order_id_from_payload(str(payload))
+        if order_id:
+            self._add_hint(order_id)
+
+    async def _handle_dom_hint(self, href: Optional[str]) -> None:
+        order_id = self._extract_order_id_from_payload(href or "")
+        if order_id:
+            self._add_hint(order_id)
+
+    def _add_hint(self, order_id: str) -> None:
+        if not self.tracker.can_attempt(order_id):
+            return
+        if order_id in self.priority_queue:
+            return
+        logging.info(f"Получен сигнал о новом заказе {order_id}, добавляем в очередь приоритетов")
+        self.priority_queue.append(order_id)
+
+    @staticmethod
+    def _extract_order_id_from_payload(payload: str) -> Optional[str]:
+        match = OrderTracker.ID_PATTERN.search(payload)
+        return match.group(1) if match else None
